@@ -19,206 +19,80 @@ from datasets.snowy_scenes import FusedDataSetSimplified
 from models import MidFusedOutDet_PCD_Only
 from models.lovasz_losses import lovasz_softmax_flat
 from scripts.deterministic import configure_randomness
-from scripts.util import evaluate_cm
+from scripts.eco_system import TrainingEcoSystem
+from scripts.util import evaluate_cm, LovaszBinarySeg, GenericCriterion
 
 warnings.filterwarnings("ignore")
 
+
+class M05Trainer(TrainingEcoSystem):
+    def __init__(self, config, device, name="M05 Trainer"):
+        super().__init__(config, device, name)
+
+
 def main(args):
+    # process the arguments
     train_batch_size = args.train_batch_size
     val_batch_size = args.val_batch_size
     model_save_path = args.model_save_path
     output_model_path = os.path.join(model_save_path, 'outdet.pt')
     output_loss_model_path = os.path.join(model_save_path, 'outdet_loss.pt')
-    os.makedirs(model_save_path, exist_ok=True)
     device = torch.device(args.device)
-    dilate = 1
 
-    # prepare miou fun
+    # load the config file
     with open(args.label_config, 'r') as stream:
         config = yaml.safe_load(stream)
+    # move some args to config
+    config['val_batch_size'] = val_batch_size
+    config['train_batch_size'] = train_batch_size
+    config['num_epoch'] = args.num_epoch
 
-    class_strings = config["labels"]
-    class_inv_remap = config["learning_map_inv"]
-    # value for masking labels which are not labeled.
-    num_classes = len(class_inv_remap)
-    ordered_class_names = [class_strings[class_inv_remap[i]] for i in range(num_classes)]
-
-    # channels_to_use = len(rgb_ind)
+    # create the trainer
+    trainer = M05Trainer(config=config, device=device, name="M05 Trainer")
+    trainer.set_output_model_path(output_model_path)
+    trainer.set_output_model_loss_path(output_loss_model_path)
 
     # prepare model
-    model = MidFusedOutDet_PCD_Only(num_classes=num_classes, kernel_size=args.K, depth=1, dilate=dilate, width=256 )
+    model = MidFusedOutDet_PCD_Only(num_classes=trainer.num_classes, kernel_size=args.K, depth=1, dilate=1, width=256)
     model = model.to(device)
+    # send the model to trainer
+    trainer.set_model(model)
 
-    optimizer = QHAdam(model.parameters(), lr=1e-3, nus=(0.7, 1.0), betas=(0.9, 0.999))
+    # create optimizer
+    optimizer = QHAdam(trainer.model.parameters(), lr=1e-3, nus=(0.7, 1.0), betas=(0.9, 0.999))
+    # send the optimizer to trainer
+    trainer.set_optimizer(optimizer)
+    # create scheduler
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer=trainer.optimizer, milestones=[30, 40, 45], gamma=0.1)
+    # send the scheduler ot trainer
+    trainer.set_scheduler(scheduler)
 
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=[30, 40, 45], gamma=0.1)
+    # create criterion of CE and Lovasz softmax loss
+    primary_criterion = torch.nn.CrossEntropyLoss()
+    secondary_criterion = LovaszBinarySeg()
+    criterion = GenericCriterion(primary=primary_criterion, secondary=secondary_criterion)
+    # send the criterion to trainer
+    trainer.set_criterion(criterion)
 
-    criterion = torch.nn.CrossEntropyLoss()
     # prepare dataset
     tree_k = int(np.round(args.K * args.K))
+
     train_dataset = FusedDataSetSimplified(data_root=args.data_dir, data_set='train', device=device, k=tree_k,
                                            recalculate=False, falling_only=False,
                                            label_conf='../../datasets/binary_desnow_rs.yaml',
-                                           limit=None, drop_thermal=False, drop_rgb=False,)
+                                           limit=100, drop_thermal=False, drop_rgb=False, )
 
     val_dataset = FusedDataSetSimplified(data_root=args.data_dir, data_set='val', device=device, k=tree_k,
                                          recalculate=False, falling_only=False,
                                          label_conf='../../datasets/binary_desnow_rs.yaml',
-                                         limit=None, drop_thermal=False, drop_rgb=False, )
+                                         limit=100, drop_thermal=False, drop_rgb=False, )
+    # send the data to trainer
+    trainer.set_training_dataset(train_dataset)
+    trainer.set_validation_dataset(val_dataset)
 
-    train_dataset_loader = torch.utils.data.DataLoader(dataset=train_dataset,
-                                                       batch_size=train_batch_size,
-                                                       shuffle=True,
-                                                       num_workers=12,
-                                                       collate_fn=collate_fn_generic)
-    val_dataset_loader = torch.utils.data.DataLoader(dataset=val_dataset,
-                                                     batch_size=val_batch_size,
-                                                     shuffle=False,
-                                                     num_workers=12,
-                                                     collate_fn=collate_fn_generic)
 
     # training
-
-    # training
-    epoch = 0
-    best_val_miou = 0
-    best_val_loss = np.inf
-    train_losses = list()
-    while epoch < args.num_epoch:
-        train_loss = train_epoch(epoch, model, train_dataset_loader, criterion, optimizer, num_classes,
-                                 ordered_class_names, device)
-        val_miou, val_loss = validate_epoch(epoch, model, val_dataset_loader, criterion, num_classes, ordered_class_names, device)
-        train_losses.append(train_loss)
-        scheduler.step()
-        # save model if performance is improved
-        if best_val_miou <= val_miou:
-            print(f'Saving model at epoch: {epoch}')
-            best_val_miou = val_miou
-            torch.save(model.state_dict(), output_model_path)
-        if best_val_loss > val_loss:
-            print(f'Saving loss model at epoch: {epoch}')
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), output_loss_model_path)
-        print('Epoch: %d Current val miou is %.3f  while the best val miou is %.3f' %
-              (epoch, val_miou, best_val_miou))
-        epoch += 1
-
-    plt.plot(train_losses)
-    plt.show()
-
-
-def train_epoch(epoch, model, train_dataset_loader, criterion, optimizer, n_classes, class_names, device):
-    loss_list = []
-    pbar = tqdm(total=len(train_dataset_loader), desc=f'Epoch {epoch}')
-    # training
-    model.train()
-    pcm = np.zeros(shape=(n_classes, 2, 2))
-    for i_iter, batch in enumerate(train_dataset_loader):
-        data_dict = dict()
-        # ts = time.time_ns()
-        keys = batch.keys()
-        Q = queue.Queue()
-        threads = list()
-        for key in keys:
-            param = (batch, key, device)
-            t = threading.Thread(target=to_gpu, args=(param, Q))
-            threads.append(t)
-
-        for t in threads:
-            t.start()
-            res = Q.get()
-            data_dict = data_dict | res
-
-        for t in threads:
-            t.join()
-        label = data_dict['mapped_label'].long().view(-1)
-
-        optimizer.zero_grad()
-        logit, indices = model(data_dict)
-        logit = logit[indices]
-        label = label[indices]
-        try:
-            loss = criterion(logit, label) + lovasz_softmax_flat(torch.nn.functional.softmax(logit, dim=1),
-                                                                         label, ignore=None)
-            loss.backward()
-            optimizer.step()
-        except ValueError:
-            print(batch['fname'])
-
-        loss_list.append(loss.item())
-        # zero the parameter gradients
-
-        pbar.update(1)
-        pbar.set_postfix({'Loss': np.mean(loss_list)})
-        predict_labels = torch.argmax(logit, dim=-1)
-        mcm = multilabel_confusion_matrix(y_true=label.cpu().numpy(), y_pred=predict_labels.cpu().numpy(),
-                                          labels=[i for i in range(n_classes)])
-        pcm += mcm
-
-    pbar.close()
-    IOUs = list()
-    for i, cm in enumerate(pcm):
-        iou = evaluate_cm(cm, class_names[i])
-        IOUs.append(iou)
-    class_jaccard = torch.tensor(np.array(IOUs))
-    print('Average iou: ', class_jaccard[1:].mean())
-    return np.mean(loss_list)
-
-
-def validate_epoch(epoch, model, val_dataset_loader, criterion, n_classes, class_names, device):
-    model.eval()
-    val_loss_list = []
-    pcm = np.zeros(shape=(n_classes, 2, 2))
-    pbar = tqdm(total=len(val_dataset_loader), desc=f'Epoch {epoch}')
-    with torch.no_grad():
-        for i_iter_val, batch in enumerate(
-                val_dataset_loader):
-            data_dict = dict()
-            # ts = time.time_ns()
-            keys = batch.keys()
-            Q = queue.Queue()
-            threads = list()
-            for key in keys:
-                param = (batch, key, device)
-                t = threading.Thread(target=to_gpu, args=(param, Q))
-                threads.append(t)
-
-            for t in threads:
-                t.start()
-                res = Q.get()
-                data_dict = data_dict | res
-
-            for t in threads:
-                t.join()
-            label = data_dict['mapped_label'].long().view(-1)
-            (logit, _), indices = model(data_dict)
-            logit = logit[indices]
-            label = label[indices]
-
-            loss = criterion(logit, label) + lovasz_softmax_flat(torch.nn.functional.softmax(logit, dim=1),
-                                                             label, ignore=None)
-
-            predict_labels = torch.argmax(logit, dim=1)
-            mcm = multilabel_confusion_matrix(y_true=label.cpu().numpy(), y_pred=predict_labels.cpu().numpy(),
-                                              labels=[i for i in range(n_classes)])
-            pcm += mcm
-            val_loss_list.append(loss.detach().cpu().numpy())
-            pbar.update()
-
-            pbar.set_postfix({'Loss': np.mean(val_loss_list)})
-    pbar.close()
-    IOUs = list()
-    for i, cm in enumerate(pcm):
-        if i != 0:
-            iou = evaluate_cm(cm, class_names[i])
-            IOUs.append(iou)
-    class_jaccard = torch.tensor(np.array(IOUs))
-
-    val_miou = class_jaccard.sum().item() / class_jaccard.size(0)
-    return val_miou, np.mean(val_loss_list)
-
-
-
+    trainer.run_training()
 
 if __name__ == '__main__':
     # Training settings
